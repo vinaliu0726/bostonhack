@@ -1,0 +1,7 @@
+# BiteStop theme: always light (white) even if the laptop is in dark mode.
+[theme]
+base = "light"
+primaryColor = "#FF6B4A"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F6F7FB"
+textColor = "#1F2333"

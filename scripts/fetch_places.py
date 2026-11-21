@@ -17,7 +17,12 @@ price_level: 0=free, 1=$, 2=$$, 3=$$$, 4=$$$$, blank=unknown.
 hours_json: regularOpeningHours.periods as JSON (for "open now" in ranking.py).
 
 Run:  python scripts/fetch_places.py
-      python scripts/fetch_places.py "Harvard" "Kenmore"   # only these stations
+      python scripts/fetch_places.py --all                  # every subway station (~236 calls)
+      python scripts/fetch_places.py "Museum of Fine Arts" "Fenway"
+          -> fetch only these stations and ADD them to the existing places.csv
+      python scripts/fetch_places.py --deep "Harvard Avenue" "Allston Street"
+          -> also one search per popular cuisine (12 calls/station instead of 2),
+             finds many more Korean/Chinese/... places in dense areas. Adds to file.
 """
 import json
 import math
@@ -30,6 +35,25 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+# Google's cafe/restaurant search also returns museums, hotels... that merely *contain*
+# a cafe. Keep a place only if its main type sounds like food. (Same list as src/ranking.py.)
+FOOD_WORDS = (
+    "restaurant", "cafe", "café", "coffee", "bakery", "tea", "dessert", "ice cream",
+    "juice", "donut", "bagel", "sandwich", "deli", "diner", "food", "pizza", "steak",
+    "bar", "pub", "grill", "bistro", "brunch", "breakfast", "confection", "chocolate",
+    "candy", "acai", "boba", "noodle", "ramen", "sushi", "taco", "burrito", "meal",
+    "cafeteria", "patisserie", "creperie", "buffet", "eatery", "snack", "kitchen",
+    "bubble", "yogurt", "dumpling", "hot pot", "barbecue", "bbq", "chicken", "burger",
+)
+NOT_FOOD_WORDS = ("barber", "supply", "pet ", "grocery", "supermarket", "museum", "hotel")
+
+
+def is_food(primary_type: str) -> bool:
+    t = primary_type.lower()
+    if not t:
+        return True
+    return any(w in t for w in FOOD_WORDS) and not any(w in t for w in NOT_FOOD_WORDS)
+
 ROOT = Path(__file__).resolve().parent.parent
 STATIONS = ROOT / "data" / "stations.csv"
 OUT = ROOT / "data" / "places.csv"
@@ -40,17 +64,35 @@ DETOUR = 1.3            # streets aren't straight lines
 
 # Popular stations for college students (names must match data/stations.csv).
 DEFAULT_STATIONS = [
-    "Harvard", "Central", "Kendall/MIT", "Davis", "Porter",
-    "Park Street", "Downtown Crossing", "Chinatown", "Haymarket",
-    "Copley", "Hynes Convention Center", "Kenmore",
-    "Boston University Central", "Northeastern University", "Coolidge Corner",
+    # Cambridge / Somerville
+    "Harvard", "Central", "Kendall/MIT", "Davis", "Porter", "Alewife",
+    "Union Square", "Lechmere", "Medford/Tufts", "Ball Square", "Assembly", "Sullivan Square",
+    # Downtown
+    "Park Street", "Downtown Crossing", "Chinatown", "Haymarket", "Government Center",
+    "State", "South Station", "North Station", "Aquarium", "Boylston", "Arlington",
+    # Back Bay / Fenway / Longwood
+    "Copley", "Back Bay", "Prudential", "Hynes Convention Center", "Symphony",
+    "Massachusetts Avenue", "Kenmore", "Fenway", "Longwood Medical Area",
+    "Museum of Fine Arts", "Northeastern University", "Brigham Circle", "Ruggles",
+    # BU / Allston / Brookline
+    "Boston University East", "Boston University Central", "Babcock Street",
+    "Harvard Avenue", "Packard's Corner", "Allston Street", "Griggs Street", "Warren Street", "Coolidge Corner", "Brookline Village",
+    "Boston College",
+    # South / East
+    "JFK/UMass", "Jackson Square", "Forest Hills", "Maverick", "Airport",
 ]
-
 # (category label, includedTypes) — one searchNearby call each.
 SEARCHES = [
     ("restaurant", ["restaurant"]),
     ("cafe", ["cafe", "coffee_shop", "bakery"]),
 ]
+# Extra searches for --deep: Google caps each search at 20, so a broad "restaurant"
+# search misses most places in dense areas. One search per cuisine digs deeper.
+DEEP_SEARCHES = [("restaurant", [t]) for t in [
+    "korean_restaurant", "chinese_restaurant", "japanese_restaurant", "ramen_restaurant",
+    "sushi_restaurant", "thai_restaurant", "vietnamese_restaurant", "indian_restaurant",
+    "mexican_restaurant", "pizza_restaurant",
+]]
 
 FIELDS = ",".join("places." + f for f in [
     "id", "displayName", "primaryType", "primaryTypeDisplayName", "types",
@@ -103,6 +145,8 @@ def search_nearby(lat: float, lon: float, types: list[str]) -> list[dict]:
 def to_row(p: dict, station: pd.Series, category: str) -> dict | None:
     if p.get("businessStatus", "OPERATIONAL") != "OPERATIONAL":
         return None
+    if not is_food(p.get("primaryTypeDisplayName", {}).get("text", "")):
+        return None                                  # e.g. a museum that has a cafe
     loc = p.get("location", {})
     lat, lon = loc.get("latitude"), loc.get("longitude")
     if lat is None or lon is None:
@@ -148,13 +192,23 @@ def main() -> None:
     if not API_KEY:
         sys.exit("GOOGLE_PLACES_API_KEY is not set. Copy .env.example to .env and fill it in.")
 
-    names = sys.argv[1:] or DEFAULT_STATIONS
+    args = sys.argv[1:]
+    deep = "--deep" in args
+    use_all = "--all" in args
+    names = [a for a in args if not a.startswith("--")]
+    add_mode = bool(names) or deep          # partial fetch -> add to existing file
+    if use_all:
+        names = pd.read_csv(STATIONS)["station_name"].unique().tolist()
+    elif not names:
+        names = DEFAULT_STATIONS
     stations = load_stations(names)
+    searches = SEARCHES + (DEEP_SEARCHES if deep else [])
+    print(f"Fetching {len(stations)} stations ({len(searches) * len(stations)} Google calls)...\n")
 
     rows = []
     for st in stations.itertuples(index=False):
         n_before = len(rows)
-        for category, types in SEARCHES:
+        for category, types in searches:
             for p in search_nearby(st.lat, st.lon, types):
                 row = to_row(p, st, category)
                 if row:
@@ -167,6 +221,12 @@ def main() -> None:
     df = (pd.DataFrame(rows)
           .drop_duplicates(["station_id", "place_id"])  # cafe+restaurant overlap
           .sort_values(["station_name", "rating_count"], ascending=[True, False]))
+
+    if add_mode and OUT.exists() and OUT.stat().st_size > 0:
+        old = pd.read_csv(OUT, dtype={"hours_json": str, "hours_text": str})
+        old = old[~old["station_id"].isin(df["station_id"])]   # refresh these stations
+        df = pd.concat([old, df], ignore_index=True)
+        print(f"Added to existing file ({len(old)} rows kept from other stations)")
     df["price_level"] = df["price_level"].astype("Int64")
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
